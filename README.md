@@ -1,6 +1,5 @@
 # Windfarm-Suitability-Philippines
 
-"""
 Wind Turbine Suitability Analysis
 ----------------------------------
 This script identifies suitable areas for wind turbine placement using
@@ -14,4 +13,3 @@ The workflow:
 5. Apply suitability criteria.
 6. Save suitability outputs.
 7. Compute distances from suitable sites to nearest transmission stations.
-"""
