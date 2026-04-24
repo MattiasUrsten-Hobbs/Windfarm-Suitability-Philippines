@@ -1,0 +1,216 @@
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+import geopandas as gpd
+from shapely.geometry import shape
+from rasterio.features import shapes
+
+# -------------------------------------------------------------------
+# FUNCTIONS
+# -------------------------------------------------------------------
+
+def mean_filter(ma, mask):
+    """
+    Applies a moving window filter over an array.
+
+    Slides a window across the raster and calculates the mean
+    value within that window.
+    """
+    pct_array = np.zeros(ma.shape, dtype=float)
+    win_area = float(mask.sum())
+    row_dim = mask.shape[0] // 2
+    col_dim = mask.shape[1] // 2
+
+    for row in range(row_dim, ma.shape[0] - row_dim):
+        for col in range(col_dim, ma.shape[1] - col_dim):
+            win = ma[row - row_dim:row + row_dim + 1,
+                     col - col_dim:col + col_dim + 1]
+            pct_array[row, col] = win.sum()
+
+    return pct_array / win_area
+
+
+def reproject_to_profile(path, ref_profile):
+    """
+    Reprojects raster to match reference raster.
+    """
+    with rasterio.open(path) as src:
+        dst = np.zeros((ref_profile["height"], ref_profile["width"]), dtype="float64")
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_profile["transform"],
+            dst_crs=ref_profile["crs"],
+            resampling=Resampling.nearest
+        )
+    return dst 
+
+
+def save_raster(path, array, profile, dtype, nodata=None):
+    """
+    Saves NumPy array as raster.
+    """
+    out_profile = profile.copy()
+    out_profile.update(dtype=dtype, count=1, nodata=nodata)
+
+    with rasterio.open(path, "w", **out_profile) as dst:
+        dst.write(array.astype(dtype), 1)
+
+
+def cell_centroids(profile):
+    """
+    Returns x,y coordinates of each raster cell center.
+    """
+    h, w = profile["height"], profile["width"]
+    transform = profile["transform"]
+
+    cols, rows = np.meshgrid(np.arange(w), np.arange(h))
+    xc = transform.c + (cols + 0.5) * transform.a
+    yc = transform.f + (rows + 0.5) * transform.e
+    return xc, yc
+
+
+def suitable_centroids(suitable_array, profile):
+    """
+    Extracts coordinates of suitable cells.
+    """
+    xc, yc = cell_centroids(profile)
+    mask = suitable_array.astype(bool)
+    return xc[mask], yc[mask]
+
+
+def load_transmission_stations(path):
+    """
+    Loads station coordinates from CSV.
+    """
+    return np.loadtxt(path, delimiter=",", skiprows=1).T[:2]
+
+
+def nearest_distances(px, py, sx, sy):
+    """
+    Computes nearest distance to transmission stations.
+    """
+    dist2 = (px[:,None] - sx[None,:])**2 + (py[:,None] - sy[None,:])**2
+    return np.sqrt(dist2.min(axis=1))
+
+
+# -------------------------------------------------------------------
+# MAIN WORKFLOW
+# -------------------------------------------------------------------
+
+# Input files
+urban_tif = "data/urban_areas.tif"
+water_tif = "data/water_bodies.tif"
+protected_tif = "data/protected_areas.tif"
+slope_tif = "data/slope.tif"
+wind_tif = "data/ws80m.tif"
+transmission_txt = "data/transmission_stations.txt"
+
+# Outputs
+suit_score_tif = "lab5_suit_score.tif"
+suitable_tif = "lab5_suitable.tif"
+
+# -------------------------------------------------------------------
+# 1. Load Wind Raster (Reference)
+# -------------------------------------------------------------------
+with rasterio.open(wind_tif) as src_w:
+    wind = src_w.read(1).astype("float64")
+    wind_profile = src_w.profile
+    wind_nodata = src_w.nodata
+
+# Clean wind
+if wind_nodata is not None:
+    wind = np.where(wind == wind_nodata, 0, wind)
+wind = np.where(wind < 0, 0, wind)
+
+# -------------------------------------------------------------------
+# 2. Reproject Layers
+# -------------------------------------------------------------------
+binary_layers = ["urban", "water", "protected"]
+
+reprojected = {
+    name: reproject_to_profile(path, wind_profile)
+    for name, path in {
+        "urban": urban_tif,
+        "water": water_tif,
+        "protected": protected_tif,
+        "slope": slope_tif
+    }.items()
+}
+
+binary_masks = {
+    name: (reprojected[name] > 0).astype("float64")
+    for name in binary_layers
+}
+
+slope_clean = reprojected["slope"]
+slope_clean = np.where(slope_clean < -1e20, 0, slope_clean)
+slope_clean = np.where(slope_clean < 0, 0, slope_clean)
+
+# -------------------------------------------------------------------
+# 3. Moving Window
+# -------------------------------------------------------------------
+window_mask = np.ones((11, 9), dtype=float)
+
+moving = {
+    name: mean_filter(binary_masks[name], window_mask)
+    for name in binary_layers
+}
+
+moving["slope"] = mean_filter(slope_clean, window_mask)
+moving["wind"]  = mean_filter(wind, window_mask)
+
+# -------------------------------------------------------------------
+# 4. Suitability Criteria
+# -------------------------------------------------------------------
+criteria = [
+    moving["urban"] == 0,
+    moving["water"] < 0.02,
+    moving["protected"] < 0.05,
+    moving["slope"] < 15,
+    moving["wind"] > 8.5
+]
+
+suit_score = np.sum(criteria, axis=0).astype("uint8")
+suitable = (suit_score == 5)
+
+# -------------------------------------------------------------------
+# 5. Save Outputs
+# -------------------------------------------------------------------
+save_raster(suit_score_tif, suit_score, wind_profile, "uint8", nodata=255)
+save_raster(suitable_tif, suitable, wind_profile, "uint8", nodata=255)
+
+print("Suitable cells:", int(suitable.sum()))
+
+# -------------------------------------------------------------------
+# 6. Distance Analysis
+# -------------------------------------------------------------------
+tx, ty = load_transmission_stations(transmission_txt)
+sx, sy = suitable_centroids(suitable, wind_profile)
+
+dist = nearest_distances(sx, sy, tx, ty)
+
+print("Min distance:", dist.min())
+print("Max distance:", dist.max())
+
+# -------------------------------------------------------------------
+# 7. Convert to Shapefile
+# -------------------------------------------------------------------
+with rasterio.open(suitable_tif) as src:
+    arr = src.read(1)
+    transform = src.transform
+    crs = src.crs
+
+mask = arr == 1
+
+results = (
+    {"geometry": shape(geom), "properties": {"value": value}}
+    for geom, value in shapes(arr, mask=mask, transform=transform)
+)
+
+gdf = gpd.GeoDataFrame.from_features(list(results), crs=crs)
+gdf.to_file("Results/suitable_areas.shp")
+
+print("Shapefile created.")
