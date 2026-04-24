@@ -1,3 +1,14 @@
+"""
+Wind Turbine Suitability Analysis (CORE ANALYSIS)
+------------------------------------------------
+This script performs all calculations for identifying suitable wind turbine locations.
+
+Outputs:
+- Suitability score raster
+- Binary suitable raster
+- Distance stats to transmission stations
+- Shapefile of suitable areas
+"""
 import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling
